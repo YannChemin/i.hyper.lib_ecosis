@@ -107,6 +107,16 @@
 # % guisection: Input
 # %end
 
+# %option
+# % key: scale
+# % type: string
+# % required: no
+# % options: auto,none,unit,percent,scaled10k
+# % answer: auto
+# % description: Reflectance scale of the source data. EcoSIS does not enforce one, so contributors upload unit (0-1), percent (0-100) and scaled-integer (0-10000) data alike; values are divided onto the unit interval at ingest. auto infers the divisor per dataset from its median value and also divides out a multiplier left on only part of a spectrum; unit/percent/scaled10k force the dataset divisor; none stores the source values untouched
+# % guisection: Output
+# %end
+
 # %flag
 # % key: f
 # % description: Force re-ingestion of datasets already present in the library (default: skip datasets whose source record count hasn't grown since last ingestion)
@@ -128,6 +138,7 @@ import os
 import sys
 import json
 import math
+import re
 import sqlite3
 import datetime
 from typing import Optional
@@ -303,11 +314,73 @@ def stream_cache_dataset_spectra(path: str):
 # ---------------------------------------------------------------------------
 
 
+# Wavelength keys are usually a bare number ("1651"), but a contributor may
+# have exported the unit with it ("1651 nm", "660 (nm) wavelength"). Those
+# keys fail float() and, when every key in the dataset carries a unit, the
+# whole dataset used to be dropped. Parse the number and the unit instead,
+# and convert to nanometres, which is what the row schema declares.
+_WAVELENGTH_KEY = re.compile(
+    r"^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(.*)$"
+)
+_WAVELENGTH_NOISE = re.compile(r"[()\[\]{}_,;:]|\bwave\s*lengths?\b|\bwl\b|\bband\b")
+_WAVELENGTH_UNIT_TO_NM = {
+    "": 1.0,
+    "nm": 1.0,
+    "nanometer": 1.0,
+    "nanometers": 1.0,
+    "nanometre": 1.0,
+    "nanometres": 1.0,
+    "um": 1000.0,
+    "\u00b5m": 1000.0,
+    "\u03bcm": 1000.0,
+    "micron": 1000.0,
+    "microns": 1000.0,
+    "micrometer": 1000.0,
+    "micrometers": 1000.0,
+    "micrometre": 1000.0,
+    "micrometres": 1000.0,
+    "a": 0.1,
+    "\u00e5": 0.1,
+    "angstrom": 0.1,
+    "angstroms": 0.1,
+}
+
+
+def _parse_wavelength_key(key) -> Optional[float]:
+    """Wavelength in nanometres for a datapoint key, or None if the key is
+    not a wavelength. Accepts a bare number and a number followed by a
+    recognised length unit, with or without the word "wavelength"; anything
+    else (a trait column, a free-text label) is rejected rather than
+    guessed at."""
+    if isinstance(key, (int, float)):
+        return float(key) if math.isfinite(float(key)) else None
+    if not isinstance(key, str):
+        return None
+    match = _WAVELENGTH_KEY.match(key)
+    if match is None:
+        return None
+    try:
+        number = float(match.group(1))
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    unit = _WAVELENGTH_NOISE.sub(" ", match.group(2).lower())
+    unit = "".join(unit.split())
+    scale = _WAVELENGTH_UNIT_TO_NM.get(unit)
+    if scale is None:
+        return None
+    return number * scale
+
+
 def _parse_spectrum(datapoints: dict) -> tuple[list[float], list[float]]:
     pairs = []
     for k, v in datapoints.items():
+        fk = _parse_wavelength_key(k)
+        if fk is None:
+            continue
         try:
-            fk, fv = float(k), float(v)
+            fv = float(v)
         except (TypeError, ValueError):
             continue
         # float() parses the literal strings "nan"/"inf" without raising
@@ -315,7 +388,7 @@ def _parse_spectrum(datapoints: dict) -> tuple[list[float], list[float]]:
         # as such would otherwise slip through as if it were a normal
         # measurement and silently corrupt any downstream computation
         # (e.g. spectral similarity matching) that assumes finite values.
-        if not (math.isfinite(fk) and math.isfinite(fv)):
+        if not math.isfinite(fv):
             continue
         pairs.append((fk, fv))
     pairs.sort(key=lambda p: p[0])
@@ -338,6 +411,357 @@ def _extract_lonlat(rec: dict) -> tuple[Optional[float], Optional[float]]:
     except (TypeError, ValueError):
         lon = lat = None
     return lon, lat
+
+
+# ---------------------------------------------------------------------------
+# Reflectance scale normalisation
+#
+# EcoSIS takes each dataset as its contributor exported it and enforces no
+# scale convention, so unit-interval (0-1), percent (0-100) and scaled-integer
+# (0-10000) reflectance all arrive through the same API. The "Measurement
+# Units" metadata field is missing or wrong often enough that it cannot be
+# trusted, so the scale is inferred from the values themselves and divided out
+# here, at harvest, rather than being left for every consumer of the shared
+# store to rediscover.
+#
+# Two different faults are handled, and they need different treatment.
+#
+# Whole-dataset scaling: every spectrum carries the same multiplier because
+# the contributor exported percent or scaled integers throughout. The divisor
+# is inferred once per dataset and applied to all of its rows.
+#
+# Range-contained scaling: one contiguous span of a spectrum carries a
+# multiplier the rest of it does not, because two instruments' output was
+# spliced together or a percent-scale block was pasted into a unit-scale file.
+# Each such span is divided by its own power of ten.
+#
+# The range case has to be conservative, because a noise spike looks like a
+# scaled range with a sample size of one. Two tests separate them: the span
+# must be long enough to be a spectral region rather than a glitch, and
+# dividing it must make it join up with the unscaled bands either side. Ratio
+# noise in the water-vapour bands at 1350-1400 nm and 1800-1900 nm, where the
+# reference signal is near zero, fails both -- it is a few bands wide and no
+# power of ten brings it level with its neighbours. Those spans are left as
+# they are: they are a data-quality problem of the source spectrum, not a
+# scale error, and dividing them would hide it.
+# ---------------------------------------------------------------------------
+
+# Candidate whole-dataset divisors, in increasing order. The intermediate
+# decades (0-10, 0-1000) are deliberately not candidates at dataset level:
+# they sit too close to their neighbours for a median to separate them, so
+# offering them would turn a dark percent-scale dataset into a plausible but
+# wrong 0-10 classification.
+_DATASET_DIVISORS = (1, 100, 10000)
+
+# What the scale= option forces, where it forces anything.
+_FORCED_DIVISORS = {"unit": 1, "percent": 100, "scaled10k": 10000}
+
+# Soft upper bound on a unit-scale dataset's median value. Reflectance
+# medians sit near 0.2-0.4; the headroom is for measurements that
+# legitimately approach 1.
+_UNIT_MEDIAN_CEILING = 1.2
+
+# Values sampled per dataset to estimate its median. The estimate only has to
+# pick a decade, so a few thousand values are ample.
+_MEDIAN_SAMPLE_CAP = 20000
+
+# A band above this counts as out of the unit interval.
+_UNIT_CEILING = 1.5
+
+# Shortest span of consecutive out-of-range bands that may be treated as a
+# scaled range rather than noise, as a band count and as a fraction of the
+# spectrum. Both must be met.
+_MIN_RUN_BANDS = 16
+_MIN_RUN_FRACTION = 0.02
+
+# Bands below the ceiling tolerated inside a scaled range without ending it: a
+# scaled range still dips under 1.5 wherever the true reflectance is low.
+_MAX_RUN_GAP = 4
+
+# Bands averaged each side of a range boundary when measuring the step
+# across it, and how near the span's own multiplier that step must be,
+# either way, for the span to count as a block spliced in from another
+# scale. Much smaller and the signal runs continuously through the
+# ceiling, which is what a correctly shaped but wrongly scaled spectrum
+# looks like; much larger and dividing would not join the two sides.
+_EDGE_BANDS = 3
+_SPLICE_TOLERANCE = 3.0
+
+# A span this much of the spectrum settles the question on its own: no
+# reflectance spectrum is mostly above the unit interval, whatever happens
+# at the span's edges.
+_DOMINANT_FRACTION = 0.80
+
+# Below that, a span covering at least this much of the spectrum and
+# showing no step at its edges is read as a whole-spectrum scale error
+# rather than a local artefact. Detector-junction and water-vapour
+# artefacts are a few percent of the bands; a mis-scaled near-infrared
+# plateau is ten percent or more.
+_RESCALE_FRACTION = 0.10
+
+# Quantile used to pick the divisor when a whole spectrum is rescaled. Not
+# the maximum: one noise spike an order of magnitude above the signal would
+# otherwise choose a divisor ten times too large.
+_RESCALE_QUANTILE = 0.99
+
+# Largest power-of-ten multiplier a single range may carry.
+_MAX_RANGE_EXPONENT = 6
+
+# Measurement types whose values belong on the unit interval. Every EcoSIS row
+# is reflectance today; the guard is here so that adding another type later
+# cannot silently rescale a quantity that is not bounded by 1.
+_UNIT_INTERVAL_TYPES = frozenset({"reflectance", "transmittance", "emissivity"})
+
+
+def _median(values: list[float]) -> float:
+    """Return the lower median of an unsorted, non-empty list."""
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def _sample_values(rows: list[dict], cap: int = _MEDIAN_SAMPLE_CAP) -> list[float]:
+    """Collect up to cap finite values spread across a batch of rows.
+
+    The stride doubles as the sample fills, so the kept values stay spread
+    over everything seen rather than over the first few spectra.
+    """
+    sample: list[float] = []
+    stride = 1
+    seen = 0
+    for row in rows:
+        for value in row["values"]:
+            if not math.isfinite(value):
+                continue
+            if seen % stride == 0:
+                sample.append(value)
+                if len(sample) >= cap:
+                    sample = sample[::2]
+                    stride *= 2
+            seen += 1
+    return sample
+
+
+def _divisor_for_median(median_value: float) -> int:
+    """Smallest whole-dataset divisor that brings a median into the unit
+    interval, or the largest candidate when none does."""
+    for divisor in _DATASET_DIVISORS:
+        if median_value / divisor <= _UNIT_MEDIAN_CEILING:
+            return divisor
+    return _DATASET_DIVISORS[-1]
+
+
+def infer_dataset_divisor(rows: list[dict]) -> int:
+    """Infer a dataset's whole-dataset scale divisor from its rows.
+
+    The statistic is the median of the values, not of the per-spectrum
+    maxima. Several EcoSIS datasets are unit-scale but carry ratio noise in
+    the water-vapour bands, where the reference signal is near zero: those
+    spectra sit at 0.3 everywhere and peak at 10 or 100 in three or four
+    bands. A median of maxima reads such a dataset as percent and divides all
+    of it by 100; a median of values does not move.
+    """
+    sample = _sample_values(rows)
+    if not sample:
+        return 1
+    return _divisor_for_median(_median(sample))
+
+
+def _scaled_runs(values: list[float]) -> list[tuple[int, int]]:
+    """Find spans of bands above the unit ceiling, as (start, stop) index
+    pairs with stop exclusive.
+
+    A span survives a dip below the ceiling of up to _MAX_RUN_GAP bands,
+    since a scaled range still goes under 1.5 wherever the true reflectance
+    is low. Non-finite bands never end a span either.
+    """
+    runs: list[tuple[int, int]] = []
+    start = None
+    last_over = -1
+    gap = 0
+    for index, value in enumerate(values):
+        if math.isfinite(value) and value > _UNIT_CEILING:
+            if start is None:
+                start = index
+            last_over = index
+            gap = 0
+            continue
+        if start is None:
+            continue
+        if math.isfinite(value):
+            gap += 1
+            if gap > _MAX_RUN_GAP:
+                runs.append((start, last_over + 1))
+                start = None
+                gap = 0
+    if start is not None:
+        runs.append((start, last_over + 1))
+    return runs
+
+
+def _edge_median(values: list[float], indices) -> float | None:
+    """Median of the finite values at the given band indices, or None."""
+    finite = [values[i] for i in indices if math.isfinite(values[i])]
+    if not finite:
+        return None
+    return _median(finite)
+
+
+def _range_divisor(median_value: float) -> int:
+    """Smallest power of ten bringing a span into the unit interval.
+
+    Unlike the whole-dataset ladder this walks every decade: a span is
+    checked against its own neighbours afterwards, which resolves the
+    ambiguity between adjacent decades that a dataset median cannot.
+    Returns 1 when no power of ten up to _MAX_RANGE_EXPONENT normalises it.
+    """
+    divisor = 10
+    for _ in range(_MAX_RANGE_EXPONENT):
+        if median_value / divisor <= 1.0:
+            return divisor
+        divisor *= 10
+    return 1
+
+
+def _boundary_step(values: list[float], start: int, stop: int) -> float | None:
+    """How far the signal jumps across the edges of a span.
+
+    Returns the larger of the two edge ratios, inside over outside, so a
+    span spliced in at one end only is still recognised. A ratio near the
+    span's own multiplier is a real discontinuity -- two instruments' output
+    pasted together. A ratio near 1 means the signal runs continuously
+    through the ceiling, which is what a correctly shaped but wrongly scaled
+    spectrum looks like. None when the span has no usable neighbour.
+    """
+    pairs = (
+        (_edge_median(values, range(max(0, start - _EDGE_BANDS), start)),
+         _edge_median(values, range(start, min(stop, start + _EDGE_BANDS)))),
+        (_edge_median(values, range(stop, min(len(values), stop + _EDGE_BANDS))),
+         _edge_median(values, range(max(start, stop - _EDGE_BANDS), stop))),
+    )
+    steps = [inside / outside for outside, inside in pairs
+             if outside is not None and inside is not None and outside > 0]
+    return max(steps) if steps else None
+
+
+def _whole_spectrum_divisor(values: list[float]) -> int:
+    """The power of ten that brings a whole spectrum into the unit interval.
+
+    Returns 1 when the spectrum is already in range, or when no power of ten
+    up to _MAX_RANGE_EXPONENT brings it there.
+    """
+    finite = sorted(v for v in values if math.isfinite(v))
+    if not finite:
+        return 1
+    high = finite[min(len(finite) - 1, int(_RESCALE_QUANTILE * len(finite)))]
+    if high <= 1.0:
+        return 1
+    return _range_divisor(high)
+
+
+def correct_scaled_ranges(values: list[float]) -> tuple[list[float], list[dict]]:
+    """Divide out a multiplier left on part of a spectrum.
+
+    Takes values already divided by any whole-dataset divisor, and returns
+    a new list with the corrections applied, plus one {start, stop, divisor}
+    record per corrected span for provenance. The input is left untouched.
+    """
+    values = list(values)
+    if not values:
+        return values, []
+
+    peak = max((v for v in values if math.isfinite(v)), default=0.0)
+    if peak <= _UNIT_CEILING:
+        return values, []
+
+    n_finite = sum(1 for v in values if math.isfinite(v))
+    if not n_finite:
+        return values, []
+    minimum_run = max(_MIN_RUN_BANDS, math.ceil(_MIN_RUN_FRACTION * len(values)))
+    corrections: list[dict] = []
+    for start, stop in _scaled_runs(values):
+        length = stop - start
+        if length < minimum_run:
+            continue                       # A glitch, not a spectral region.
+        span = [v for v in values[start:stop] if math.isfinite(v)]
+        if not span:
+            continue
+        divisor = _range_divisor(_median(span))
+        if divisor == 1:
+            continue
+        step = _boundary_step(values, start, stop)
+        fraction = length / n_finite
+
+        # A span covering most of the spectrum settles it on its own: no
+        # reflectance spectrum is mostly above the unit interval, so the
+        # multiplier belongs to the whole of it and dividing only the span
+        # would put a step where the data has none.
+        if fraction < _DOMINANT_FRACTION and step is not None:
+            if divisor / _SPLICE_TOLERANCE <= step <= divisor * _SPLICE_TOLERANCE:
+                # A real discontinuity about the size of the multiplier: a
+                # block pasted in from another scale. Divide the block.
+                for index in range(start, stop):
+                    if math.isfinite(values[index]):
+                        values[index] = values[index] / divisor
+                corrections.append(
+                    {"start": start, "stop": stop, "divisor": divisor})
+                continue
+            if fraction < _RESCALE_FRACTION:
+                # No step, and only a sliver of the spectrum: a detector
+                # junction or a water-vapour artefact rather than a scale
+                # error. Left as it is, so validation still reports it.
+                continue
+
+        whole = _whole_spectrum_divisor(values)
+        if whole == 1:
+            continue
+        for index, value in enumerate(values):
+            if math.isfinite(value):
+                values[index] = value / whole
+        return values, [{"start": 0, "stop": len(values), "divisor": whole}]
+    return values, corrections
+
+
+def _record_scale(row: dict, divisor: int, corrections: list[dict]) -> None:
+    """Note on the row what was divided out of it.
+
+    The store has no column for this, so it goes into extra_metadata, which
+    is where everything the row's own source said about itself already lives.
+    """
+    if divisor == 1 and not corrections:
+        return
+    try:
+        extra = json.loads(row["extra_metadata"])
+    except (TypeError, ValueError):
+        extra = {}
+    scale = {"normalised_to": "unit"}
+    if divisor != 1:
+        scale["source_divisor"] = divisor
+    if corrections:
+        scale["range_corrections"] = corrections
+    extra["reflectance_scale"] = scale
+    row["extra_metadata"] = json.dumps(extra, default=str)
+
+
+def normalise_batch(rows: list[dict], divisor: int) -> int:
+    """Put one batch of rows onto the unit interval, in place.
+
+    Applies the dataset divisor, then divides out any multiplier left on a
+    contiguous part of an individual spectrum. Returns how many rows needed
+    the second, per-range correction.
+    """
+    n_ranged = 0
+    for row in rows:
+        if row.get("measurement_type") not in _UNIT_INTERVAL_TYPES:
+            continue
+        values = row["values"]
+        if divisor != 1:
+            values = [v / divisor for v in values]
+        values, corrections = correct_scaled_ranges(values)
+        if corrections:
+            n_ranged += 1
+        row["values"] = values
+        _record_scale(row, divisor, corrections)
+    return n_ranged
 
 
 def build_row(dataset_info: dict, rec: dict, base_url: str) -> Optional[dict]:
@@ -373,23 +797,63 @@ def build_row(dataset_info: dict, rec: dict, base_url: str) -> Optional[dict]:
     }
 
 
-def iter_row_batches(dataset_info: dict, record_iter, base_url: str, batch_size: int):
+def iter_row_batches(
+    dataset_info: dict, record_iter, base_url: str, batch_size: int, scale: str = "auto"
+):
     """Consume a (possibly streaming) iterator of raw records and yield
     lists of built rows, batch_size at a time -- the unit both writer
     backends below write incrementally, so peak memory is one batch, not
     the whole dataset, regardless of whether record_iter is a streaming
     generator (ijson / live API pagination) or a plain in-memory list
-    (the no-ijson fallback)."""
+    (the no-ijson fallback).
+
+    Each batch is put onto the unit interval before it is yielded, as
+    scale= asks. With scale=auto the dataset's divisor is inferred from its
+    first batch and then applied to every batch of that dataset: a whole
+    dataset shares one scale, so deciding it twice could only disagree with
+    itself, and the first batch is the whole dataset for all but a handful
+    of EcoSIS datasets (the default batch is 5000 spectra). The decision
+    needs a complete batch, which is why it happens here rather than in
+    build_row."""
+    divisor = _FORCED_DIVISORS.get(scale, 1)
+    decide = scale == "auto"
+    n_ranged = 0
+    title = dataset_info.get("title", dataset_info.get("id", ""))
+
+    def finish(rows):
+        nonlocal divisor, decide, n_ranged
+        if scale == "none":
+            return rows
+        if decide:
+            divisor = infer_dataset_divisor(rows)
+            decide = False
+            if divisor != 1:
+                gs.verbose(
+                    "Dataset '{}': source values are on a 0-{} scale; "
+                    "dividing by {} to reach the unit interval.".format(
+                        title, divisor, divisor
+                    )
+                )
+        n_ranged += normalise_batch(rows, divisor)
+        return rows
+
     batch = []
     for rec in record_iter:
         row = build_row(dataset_info, rec, base_url)
         if row is not None:
             batch.append(row)
         if len(batch) >= batch_size:
-            yield batch
+            yield finish(batch)
             batch = []
     if batch:
-        yield batch
+        yield finish(batch)
+    if n_ranged:
+        gs.warning(
+            "Dataset '{}': {} record(s) carried a multiplier of their own, on "
+            "top of the dataset's; see extra_metadata.reflectance_scale.".format(
+                title, n_ranged
+            )
+        )
 
 # ---------------------------------------------------------------------------
 # Manifest (per-dataset ingest bookkeeping, for incremental/skip-if-complete)
@@ -638,12 +1102,19 @@ def main(options, flags):
     block_size = int(options.get("block_size", "100") or "100")
     max_cache_file_mb = float(options.get("max_cache_file_mb", "1000") or "1000")
     stream_batch_size = int(options.get("stream_batch_size", "5000") or "5000")
+    scale = options.get("scale", "auto") or "auto"
     force = flags["f"]
     keep_going = flags["k"]
 
     if fmt == "parquet":
         _require_pyarrow()
     streaming = _has_ijson()
+    if scale == "none":
+        gs.warning(
+            "scale=none: source values are stored as they came, so the "
+            "library will mix unit, percent and 0-10000 reflectance and "
+            "every consumer of it will have to sort that out for itself."
+        )
     if input_dir and not streaming:
         gs.warning(
             "ijson not installed: falling back to whole-file JSON parsing "
@@ -739,7 +1210,9 @@ def main(options, flags):
             continue
 
         try:
-            batches = iter_row_batches(dataset_info, record_source(), base_url, stream_batch_size)
+            batches = iter_row_batches(
+                dataset_info, record_source(), base_url, stream_batch_size, scale
+            )
             if fmt == "parquet":
                 out_path, n_rows = write_parquet_dataset_streaming(
                     output_root, dataset_id, batches, include_geometry)

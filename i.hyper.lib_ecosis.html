@@ -88,10 +88,97 @@ fixed relational schema:</p>
 <tr><td><code>wavelength_unit</code></td><td><code>"nm"</code></td></tr>
 <tr><td><code>n_bands</code></td><td>Convenience count</td></tr>
 <tr><td><code>wavelengths</code></td><td>List of band centers (nm), ascending</td></tr>
-<tr><td><code>values</code></td><td>The spectrum itself, same order as <code>wavelengths</code></td></tr>
-<tr><td><code>extra_metadata</code></td><td>JSON string: every other field EcoSIS returned for this record, verbatim &mdash; including its own <code>ecosis</code> sub-object (resource_id, dataset_link, filename, geojson, ...), so nothing is ever lost even though it isn't promoted to its own column</td></tr>
+<tr><td><code>values</code></td><td>The spectrum itself, same order as <code>wavelengths</code>, normalised to the unit interval (see <i>Reflectance scale</i> below)</td></tr>
+<tr><td><code>extra_metadata</code></td><td>JSON string: every other field EcoSIS returned for this record, verbatim &mdash; including its own <code>ecosis</code> sub-object (resource_id, dataset_link, filename, geojson, ...), so nothing is ever lost even though it isn't promoted to its own column. When the values were rescaled at ingest, a <code>reflectance_scale</code> object is added here recording what was divided out</td></tr>
 <tr><td><code>ingest_date</code></td><td>When this harvester wrote the record</td></tr>
 </table>
+
+<h3>Reflectance scale</h3>
+
+<p>EcoSIS takes each dataset as its contributor exported it and enforces no
+scale convention, so unit-interval (0&ndash;1), percent (0&ndash;100) and
+scaled-integer (0&ndash;10000) reflectance all arrive through the same API.
+Its <code>Measurement Units</code> metadata field is missing or wrong often
+enough that it cannot be trusted. The scale is therefore read from the values
+themselves and divided out here, at harvest, so that every consumer of the
+shared store &mdash; <em>i.hyper.speclookup</em>, the <code>openspeclib</code>
+library build, any query of the Parquet tree &mdash; reads one convention
+instead of rediscovering three.</p>
+
+<p>Two faults are handled, and they need different treatment.</p>
+
+<p><b>Whole-dataset scaling.</b> Every spectrum of a dataset carries the same
+multiplier. The divisor is inferred once per dataset, as the smallest of
+<code>{1, 100, 10000}</code> that brings the dataset's <b>median value</b>
+below ~1.2, and applied to all of its rows. The intermediate decades
+(0&ndash;10, 0&ndash;1000) are deliberately not candidates: they sit too close
+to their neighbours for a median to separate them.</p>
+
+<p>The statistic is the median of the <i>values</i>, not of the per-spectrum
+maxima. Several EcoSIS datasets are unit-scale but carry ratio noise in the
+water-vapour bands at 1350&ndash;1400 nm and 1800&ndash;1900 nm, where the
+reference signal is near zero: those spectra sit at 0.3 everywhere and peak at
+10 or 100 in three or four bands. A median of maxima reads such a dataset as
+percent and divides the whole of it by 100; a median of values does not
+move.</p>
+
+<p>With <b>scale</b>=<i>auto</i> (the default) the divisor is inferred from
+the dataset's first batch (<b>stream_batch_size</b>, 5000 records by default)
+and then applied to every batch of that dataset: one dataset has one scale,
+and for all but a handful of EcoSIS datasets the first batch <i>is</i> the
+whole dataset. Measured over the 195 datasets of the full local cache, the
+first-batch divisor agreed with the whole-dataset divisor in every case.
+<b>scale</b>=<i>unit</i>, <i>percent</i> or <i>scaled10k</i> force the divisor
+instead, and <b>scale</b>=<i>none</i> stores the source values untouched.</p>
+
+<p><b>Per-spectrum scaling.</b> One spectrum of an otherwise consistent
+dataset is on a different scale from the rest, or one contiguous span of a
+spectrum carries a multiplier the rest of it does not. Both show up as a run
+of bands above the unit ceiling, and telling them apart decides what may be
+divided.</p>
+
+<p>A run is considered at all only when it is long enough to be a spectral
+region rather than a glitch: at least 16 bands <b>and</b> 2 % of the
+spectrum, tolerating dips of up to 4 bands below the ceiling. Then the
+<b>step across its edges</b> &mdash; the ratio of the bands just inside to the
+bands just outside &mdash; decides between three outcomes:</p>
+
+<table border="1">
+<tr><th>What the run looks like</th><th>Reading</th><th>What is divided</th></tr>
+<tr><td>Covers 80 % or more of the spectrum</td><td>No reflectance spectrum is mostly above 1.0, whatever its edges do</td><td>the whole spectrum</td></tr>
+<tr><td>A step within a factor of 3 of the run's own multiplier</td><td>Two instruments' output spliced together, or a percent-scale block pasted into a unit-scale file</td><td>the run only</td></tr>
+<tr><td>No step, and the run covers 10 % or more</td><td>A correctly shaped spectrum whose scale is wrong throughout, showing it only where it is brightest &mdash; typically the near-infrared plateau</td><td>the whole spectrum</td></tr>
+<tr><td>No step, and the run is under 10 %</td><td>A detector-junction or water-vapour artefact</td><td>nothing</td></tr>
+</table>
+
+<p>The last row is the important one. Ratio noise in the water-vapour bands
+at 1350&ndash;1400 nm and 1800&ndash;1900 nm, and the excursions at an
+instrument's detector junctions, are a few percent of the bands and climb
+through the ceiling continuously rather than stepping across it. They are a
+data-quality problem of the source spectrum, not a scale error, and dividing
+them would hide it, so they are left for validation to report. A
+whole-spectrum rescale takes its divisor from the 99th percentile rather than
+the maximum, so one noise spike cannot choose a divisor ten times too
+large.</p>
+
+<p>The module warns, per dataset, how many records needed a per-spectrum
+correction.</p>
+
+<p>What was divided out is recorded per record in
+<code>extra_metadata</code>:</p>
+
+<div class="code"><pre>
+"reflectance_scale": {
+  "normalised_to": "unit",
+  "source_divisor": 100,
+  "range_corrections": [{"start": 1050, "stop": 2151, "divisor": 10}]
+}
+</pre></div>
+
+<p>A record with no <code>reflectance_scale</code> key was already on the unit
+interval. Note that <b>re-harvesting is what applies this to data already in
+the store</b>: rows written by an earlier run keep their source scale until
+the dataset is ingested again with <b>-f</b>.</p>
 
 <h3>Incremental re-runs</h3>
 
@@ -146,6 +233,13 @@ run.</p>
 <p><b>max_datasets</b> only bounds how many datasets a <b>search=</b> query
 can discover and queue &mdash; it does not limit <b>input_dir</b> or an
 explicit <b>dataset_id=</b> list.</p>
+
+<p>Wavelength keys are read as a number in nanometres. A contributor may
+have exported the unit with the key (<code>1651 nm</code>,
+<code>660 (nm) wavelength</code>) or used micrometres
+(<code>1.651 um</code>); those forms are parsed and converted. A key that
+is not a wavelength at all (a trait column) is left to
+<i>extra_metadata</i> rather than guessed at.</p>
 
 <h2>EXAMPLES</h2>
 
